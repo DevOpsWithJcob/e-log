@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: log-viewer
+  namespace: bizagi  # SA in bizagi namespace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-log-reader-cluster
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]  # NEW: Add this block for namespace listing
+  resources: ["namespaces"]  # NEW
+  verbs: ["get", "list", "watch"]  # NEW
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-log-reader-cluster-binding
+subjects:
+- kind: ServiceAccount
+  name: log-viewer
+  namespace: bizagi  # Bind to bizagi namespace (fixes your mismatch)
+roleRef:
+  kind: ClusterRole
+  name: pod-log-reader-cluster
+  apiGroup: rbac.authorization.k8s.io
