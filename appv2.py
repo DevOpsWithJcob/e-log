@@ -43,13 +43,13 @@ def logs():
         has_yielded_waiting = False
         while not stop_event.is_set():
             try:
-                line = log_queue.get(timeout=0.05)  # Even shorter timeout for better responsiveness
+                line = log_queue.get(timeout=0.05)  # Short timeout for responsiveness
                 if line == '__END__':  # Sentinel to end stream
                     break
                 # Yield as JSON to avoid parse errors in JS
                 yield f'data: {json.dumps({"log": line, "timestamp": time.time()})}\n\n'  # Add timestamp for live feel
                 last_yield_time = time.time()
-                has_yielded_waiting = False  # Reset if we got a log
+                # Do not reset has_yielded_waiting here to avoid repeating "Waiting for logs..." after each log
             except queue.Empty:
                 current_time = time.time()
                 if current_pod is None:
@@ -58,11 +58,11 @@ def logs():
                 elif not has_yielded_waiting:
                     yield f'data: {json.dumps({"message": "Waiting for logs..."})}\n\n'
                     last_yield_time = current_time
-                    has_yielded_waiting = True  # Only yield waiting once
-                elif current_time - last_yield_time > 10:  # Heartbeat every 10 seconds for better liveness
+                    has_yielded_waiting = True  # Only yield waiting once per connection
+                elif current_time - last_yield_time > 10:  # Heartbeat every 10 seconds for liveness
                     yield ': heartbeat\n\n'
                     last_yield_time = current_time
-                time.sleep(0.05)  # Shorter sleep for improved responsiveness
+                time.sleep(0.05)  # Short sleep for improved responsiveness
         yield f'data: {json.dumps({"message": "Log stream ended. Select another pod in terminal or web."})}\n\n'
     
     return Response(generate(), mimetype='text/event-stream')
@@ -89,18 +89,21 @@ def get_pods_in_namespace(namespace):
 
 @app.route('/select_pod/<namespace>/<pod_name>')
 def select_pod(namespace, pod_name):
-    """Select a pod and start streaming its logs, load from cache first (only if namespace allowed)."""
+    """Select a pod and start streaming its logs (clear cache and start fresh, only if namespace allowed)."""
     if namespace not in ALLOWED_NAMESPACES:
         return "Namespace not allowed", 403
     print(f"{colorama.Fore.YELLOW}Pod selected from web: {pod_name} in {namespace}")
     stop_log_streaming()
     
-    # Load cached logs if available
-    cache_key = f"logs:{namespace}:{pod_name}"
-    cached_logs = redis_client.lrange(cache_key, 0, -1)
-    if cached_logs:
-        for log in cached_logs:
-            log_queue.put(log)
+    # Clear the queue to avoid any old logs from previous pods
+    while not log_queue.empty():
+        try:
+            log_queue.get_nowait()
+        except queue.Empty:
+            break
+    
+    # Do not load cached logs; we want to start fresh
+    # Cache will be cleared in start_log_streaming
     
     start_log_streaming(pod_name, namespace)
     return "OK"
@@ -126,10 +129,10 @@ def index():
         <div id="logs">Connecting to stream...</div>
         <button onclick="loadNamespaces()">Refresh Namespaces</button>
         <script>
-            const logsDiv = document.getElementById('logs');
-            const namespaceListDiv = document.getElementById('namespace-list');
-            const podListDiv = document.getElementById('pod-list');
-            const evtSource = new EventSource("/logs");
+            let logsDiv = document.getElementById('logs');
+            let namespaceListDiv = document.getElementById('namespace-list');
+            let podListDiv = document.getElementById('pod-list');
+            let evtSource = new EventSource("/logs");
 
             evtSource.onmessage = function(event) {
                 try {
@@ -148,7 +151,7 @@ def index():
                 logsDiv.scrollTop = logsDiv.scrollHeight;  // Auto-scroll
             };
             evtSource.onerror = function() {
-                logsDiv.innerHTML += '<p style="color: red;">Connection error. Refresh the page.</p>';
+                logsDiv.innerHTML += '<p style="color: red;">Connection lost. Reconnecting...</p>';
             };
 
             function loadNamespaces() {
@@ -194,7 +197,9 @@ def index():
             function selectPod(ns, name) {
                 fetch(`/select_pod/${ns}/${name}`)
                     .then(() => {
+                        evtSource.close();
                         logsDiv.innerHTML = '<p>Switching to ' + name + ' in ' + ns + '</p>';
+                        evtSource = new EventSource("/logs");
                     });
             }
 
@@ -255,7 +260,7 @@ def display_dashboard(pods: List[dict], current_namespace: str) -> None:
     print(f"{colorama.Fore.CYAN}Enter pod ID to view logs in web and terminal, namespace name to filter (or 'all'/'q' to quit): ", end="")
 
 def start_log_streaming(pod_name: str, namespace: str) -> None:
-    """Start streaming logs from the pod into the queue for Flask and print to terminal, cache in Redis."""
+    """Start streaming logs from the pod into the queue for Flask and print to terminal, cache in Redis, with reconnection."""
     global current_pod, stream_thread
     if namespace not in ALLOWED_NAMESPACES:
         print(f"{colorama.Fore.RED}Namespace '{namespace}' not allowed.")
@@ -275,25 +280,47 @@ def start_log_streaming(pod_name: str, namespace: str) -> None:
     
     def streamer():
         v1 = client.CoreV1Api()
-        w = watch.Watch()
-        try:
-            for line in w.stream(v1.read_namespaced_pod_log, name=pod_name, namespace=namespace, follow=True, tail_lines=100):
-                if stop_event.is_set():
-                    break
-                print(line)  # Print to terminal
-                log_queue.put(line)  # Put log line into queue for Flask
-                redis_client.rpush(cache_key, line)  # Cache in Redis (list, keep last 1000 lines)
-                if redis_client.llen(cache_key) > 1000:
-                    redis_client.lpop(cache_key)  # Trim to 1000 lines
-        except ApiException as e:
-            error_msg = f"Error streaming logs: {e}"
-            print(f"{colorama.Fore.RED}{error_msg}")
-            log_queue.put(error_msg)
-            redis_client.rpush(cache_key, error_msg)
-        finally:
-            w.stop()
-            log_queue.put('__END__')  # Sentinel to end SSE stream
-            current_pod = None
+        last_timestamp = None
+        w = None
+        while not stop_event.is_set():
+            try:
+                kwargs = {
+                    'name': pod_name,
+                    'namespace': namespace,
+                    'follow': True,
+                    'timestamps': True,  # Include timestamps to resume
+                    'tail_lines': 100 if last_timestamp is None else 0,
+                }
+                if last_timestamp:
+                    kwargs['since_time'] = last_timestamp
+                w = watch.Watch()
+                for line in w.stream(v1.read_namespaced_pod_log, **kwargs):
+                    if stop_event.is_set():
+                        break
+                    # Parse timestamp and message
+                    parts = line.split(' ', 1)
+                    if len(parts) == 2:
+                        last_timestamp = parts[0]
+                        msg = parts[1]
+                    else:
+                        msg = line
+                    print(msg)  # Print to terminal
+                    log_queue.put(msg)  # Put log line into queue for Flask
+                    redis_client.rpush(cache_key, msg)  # Cache in Redis
+                    if redis_client.llen(cache_key) > 1000:
+                        redis_client.lpop(cache_key)  # Trim to 1000 lines
+                # If exited without stop, reconnect
+            except ApiException as e:
+                error_msg = f"Error streaming logs: {e}"
+                print(f"{colorama.Fore.RED}{error_msg}")
+                log_queue.put(error_msg)
+                redis_client.rpush(cache_key, error_msg)
+                time.sleep(1)  # Retry delay
+            finally:
+                if w is not None:
+                    w.stop()
+        log_queue.put('__END__')  # Sentinel to end SSE stream
+        current_pod = None
 
     stream_thread = threading.Thread(target=streamer)
     stream_thread.start()

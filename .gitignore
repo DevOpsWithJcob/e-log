@@ -1,3 +1,6 @@
 .history
 venv
 wsl-venv
+kubeconfig.yaml
+*.tar
+.tar
