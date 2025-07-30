@@ -1,0 +1,21 @@
+# docker-compose.yml
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./kubeconfig.yaml:/kubeconfig.yaml:ro  # Mount your kubeconfig file
+    depends_on:
+      - redis
+    environment:
+      - FLASK_ENV=development
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+# To run: docker-compose up
+# Ensure you have kubeconfig.yaml in the current directory for mounting.
+# Visit http://localhost:5000 in your browser.

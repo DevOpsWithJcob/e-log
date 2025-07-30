@@ -1,3 +1,4 @@
+# app.py
 import os
 import sys
 import time
@@ -10,9 +11,10 @@ import colorama  # pip install colorama
 import threading
 import queue  # For log queueing and input queueing
 import json  # For safe JSON encoding
+import redis  # pip install redis
 
 # Flask imports (pip install flask)
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, render_template_string
 
 colorama.init(autoreset=True)
 
@@ -23,23 +25,26 @@ input_queue = queue.Queue()  # Queue for user input in CLI
 stop_event = threading.Event()  # To signal stopping the log stream
 stream_thread = None  # Global stream thread
 
+# Redis setup
+redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
+
 # Flask app setup
 app = Flask(__name__)
 
 @app.route('/logs')
 def logs():
-    """SSE endpoint for streaming logs."""
+    """SSE endpoint for streaming logs with improved real-time handling."""
     def generate():
-        yield 'data: {"message": "Connected to log stream"}\n\n'
+        yield 'data: {"message": "Connected to acog stream"}\n\n'
         last_yield_time = time.time()
         has_yielded_waiting = False
         while not stop_event.is_set():
             try:
-                line = log_queue.get(timeout=0.1)  # Shorter timeout for responsiveness
+                line = log_queue.get(timeout=0.05)  # Even shorter timeout for better responsiveness
                 if line == '__END__':  # Sentinel to end stream
                     break
                 # Yield as JSON to avoid parse errors in JS
-                yield f'data: {json.dumps({"log": line})}\n\n'
+                yield f'data: {json.dumps({"log": line, "timestamp": time.time()})}\n\n'  # Add timestamp for live feel
                 last_yield_time = time.time()
                 has_yielded_waiting = False  # Reset if we got a log
             except queue.Empty:
@@ -51,50 +56,71 @@ def logs():
                     yield f'data: {json.dumps({"message": "Waiting for logs..."})}\n\n'
                     last_yield_time = current_time
                     has_yielded_waiting = True  # Only yield waiting once
-                elif current_time - last_yield_time > 15:  # Heartbeat every 15 seconds to keep connection alive
+                elif current_time - last_yield_time > 10:  # Heartbeat every 10 seconds for better liveness
                     yield ': heartbeat\n\n'
                     last_yield_time = current_time
-                time.sleep(0.1)  # Short sleep to avoid CPU spin
+                time.sleep(0.05)  # Shorter sleep for improved responsiveness
         yield f'data: {json.dumps({"message": "Log stream ended. Select another pod in terminal or web."})}\n\n'
     
     return Response(generate(), mimetype='text/event-stream')
 
-@app.route('/pods')
-def get_pods():
-    """API to get list of all pods."""
-    pods = list_pods(None)  # List all pods
+@app.route('/namespaces')
+def get_namespaces():
+    """API to get list of all namespaces."""
+    v1 = client.CoreV1Api()
+    try:
+        namespaces = v1.list_namespace().items
+        ns_list = [ns.metadata.name for ns in namespaces]
+        return jsonify(ns_list)
+    except ApiException as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/pods/<namespace>')
+def get_pods_in_namespace(namespace):
+    """API to get list of pods in a namespace."""
+    pods = list_pods(namespace)
     pod_list = [{"name": p["name"], "namespace": p["namespace"]} for p in pods]
     return jsonify(pod_list)
 
 @app.route('/select_pod/<namespace>/<pod_name>')
 def select_pod(namespace, pod_name):
-    """Select a pod and start streaming its logs."""
+    """Select a pod and start streaming its logs, load from cache first."""
     print(f"{colorama.Fore.YELLOW}Pod selected from web: {pod_name} in {namespace}")
     stop_log_streaming()
+    
+    # Load cached logs if available
+    cache_key = f"logs:{namespace}:{pod_name}"
+    cached_logs = redis_client.lrange(cache_key, 0, -1)
+    if cached_logs:
+        for log in cached_logs:
+            log_queue.put(log)
+    
     start_log_streaming(pod_name, namespace)
     return "OK"
 
 @app.route('/')
 def index():
-    """Simple HTML page to display pod list and logs."""
-    return """
+    """Main page displaying namespaces."""
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Kubernetes Pod Logs</title>
         <style>
             body { font-family: monospace; background: #f0f0f0; padding: 20px; }
-            #pod-list { border: 1px solid #ccc; padding: 10px; margin-bottom: 20px; background: white; }
+            .list { border: 1px solid #ccc; padding: 10px; margin-bottom: 20px; background: white; }
             #logs { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: scroll; background: white; }
         </style>
     </head>
     <body>
-        <h1>Real-Time Pod Logs</h1>
-        <div id="pod-list">Loading pods...</div>
-        <button onclick="loadPods()">Refresh Pods</button>
+        <h1>Real-Time Pod Logs - Namespaces</h1>
+        <div id="namespace-list" class="list">Loading namespaces...</div>
+        <div id="pod-list" class="list" style="display: none;">Loading pods...</div>
         <div id="logs">Connecting to stream...</div>
+        <button onclick="loadNamespaces()">Refresh Namespaces</button>
         <script>
             const logsDiv = document.getElementById('logs');
+            const namespaceListDiv = document.getElementById('namespace-list');
             const podListDiv = document.getElementById('pod-list');
             const evtSource = new EventSource("/logs");
 
@@ -104,7 +130,8 @@ def index():
                     if (data.message) {
                         logsDiv.innerHTML += '<p style="color: gray;">' + data.message + '</p>';
                     } else if (data.log) {
-                        logsDiv.innerHTML += '<p>' + data.log.replace(/\\n/g, '<br>') + '</p>';  // Handle newlines
+                        const ts = new Date(data.timestamp * 1000).toLocaleTimeString();
+                        logsDiv.innerHTML += '<p><span style="color: blue;">[' + ts + ']</span> ' + data.log.replace(/\\n/g, '<br>') + '</p>';  // Add timestamp for live display
                     } else {
                         logsDiv.innerHTML += '<p>' + event.data + '</p>';  // Fallback
                     }
@@ -117,20 +144,44 @@ def index():
                 logsDiv.innerHTML += '<p style="color: red;">Connection error. Refresh the page.</p>';
             };
 
-            function loadPods() {
-                fetch('/pods')
+            function loadNamespaces() {
+                fetch('/namespaces')
                     .then(response => response.json())
-                    .then(pods => {
-                        let html = '<h2>Available Pods (Click to select)</h2><ul>';
-                        pods.forEach(pod => {
-                            html += `<li><a href="#" onclick="selectPod('${pod.namespace}', '${pod.name}')">${pod.name} (${pod.namespace})</a></li>`;
+                    .then(namespaces => {
+                        let html = '<h2>Available Namespaces (Click to view pods)</h2><ul>';
+                        namespaces.forEach(ns => {
+                            html += `<li><a href="#" onclick="loadPods('${ns}')">${ns}</a></li>`;
                         });
                         html += '</ul>';
+                        namespaceListDiv.innerHTML = html;
+                        podListDiv.style.display = 'none';
+                    })
+                    .catch(error => {
+                        namespaceListDiv.innerHTML = '<p style="color: red;">Error loading namespaces: ' + error + '</p>';
+                    });
+            }
+
+            function loadPods(ns) {
+                fetch(`/pods/${ns}`)
+                    .then(response => response.json())
+                    .then(pods => {
+                        let html = `<h2>Pods in ${ns} (Click to view logs)</h2><ul>`;
+                        pods.forEach(pod => {
+                            html += `<li><a href="#" onclick="selectPod('${ns}', '${pod.name}')">${pod.name}</a></li>`;
+                        });
+                        html += '</ul><button onclick="backToNamespaces()">Back to Namespaces</button>';
                         podListDiv.innerHTML = html;
+                        podListDiv.style.display = 'block';
+                        namespaceListDiv.style.display = 'none';
                     })
                     .catch(error => {
                         podListDiv.innerHTML = '<p style="color: red;">Error loading pods: ' + error + '</p>';
                     });
+            }
+
+            function backToNamespaces() {
+                podListDiv.style.display = 'none';
+                namespaceListDiv.style.display = 'block';
             }
 
             function selectPod(ns, name) {
@@ -140,18 +191,18 @@ def index():
                     });
             }
 
-            // Load pods on page load
-            loadPods();
+            // Load namespaces on page load
+            loadNamespaces();
         </script>
     </body>
     </html>
-    """
+    """)
 
 def run_flask():
     """Run Flask in a background thread."""
-    app.run(debug=False, use_reloader=False, port=5000)
+    app.run(debug=False, use_reloader=False, port=5000, host='0.0.0.0')
 
-def load_kubeconfig(kubeconfig_path: str = "kubeconfig.yaml") -> bool:
+def load_kubeconfig(kubeconfig_path: str = "/kubeconfig.yaml") -> bool:  # Adjusted for Docker mount
     """Load and test the Kubernetes configuration."""
     if not os.path.exists(kubeconfig_path):
         print(f"{colorama.Fore.RED}Error: Kubeconfig file '{kubeconfig_path}' not found.")
@@ -170,13 +221,11 @@ def list_pods(namespace: str = None) -> List[dict]:
     v1 = client.CoreV1Api()
     try:
         if namespace:
-            print(f"{colorama.Fore.YELLOW}Listing pods in namespace '{namespace}'...")
             pods = v1.list_namespaced_pod(namespace).items
         else:
-            print(f"{colorama.Fore.YELLOW}Listing pods in all namespaces...")
             pods = v1.list_pod_for_all_namespaces().items
         if not pods:
-            print(f"{colorama.Fore.YELLOW}No pods found.")
+            return []
         return [{"index": i, "name": pod.metadata.name, "namespace": pod.metadata.namespace} for i, pod in enumerate(pods, start=1)]
     except ApiException as e:
         print(f"{colorama.Fore.RED}Error listing pods: {e}")
@@ -194,7 +243,7 @@ def display_dashboard(pods: List[dict], current_namespace: str) -> None:
     print(f"{colorama.Fore.CYAN}Enter pod ID to view logs in web and terminal, namespace name to filter (or 'all'/'q' to quit): ", end="")
 
 def start_log_streaming(pod_name: str, namespace: str) -> None:
-    """Start streaming logs from the pod into the queue for Flask and print to terminal."""
+    """Start streaming logs from the pod into the queue for Flask and print to terminal, cache in Redis."""
     global current_pod, stream_thread
     current_pod = {'name': pod_name, 'namespace': namespace}
     stop_event.clear()  # Reset stop event
@@ -206,6 +255,9 @@ def start_log_streaming(pod_name: str, namespace: str) -> None:
         except queue.Empty:
             break
     
+    cache_key = f"logs:{namespace}:{pod_name}"
+    redis_client.delete(cache_key)  # Clear old cache
+    
     def streamer():
         v1 = client.CoreV1Api()
         w = watch.Watch()
@@ -215,10 +267,14 @@ def start_log_streaming(pod_name: str, namespace: str) -> None:
                     break
                 print(line)  # Print to terminal
                 log_queue.put(line)  # Put log line into queue for Flask
+                redis_client.rpush(cache_key, line)  # Cache in Redis (list, keep last 1000 lines)
+                if redis_client.llen(cache_key) > 1000:
+                    redis_client.lpop(cache_key)  # Trim to 1000 lines
         except ApiException as e:
             error_msg = f"Error streaming logs: {e}"
             print(f"{colorama.Fore.RED}{error_msg}")
             log_queue.put(error_msg)
+            redis_client.rpush(cache_key, error_msg)
         finally:
             w.stop()
             log_queue.put('__END__')  # Sentinel to end SSE stream
@@ -280,37 +336,48 @@ def main(initial_namespace: str) -> None:
     flask_thread.start()
     print(f"{colorama.Fore.GREEN}Flask web server started. Visit http://localhost:5000 for pod list and logs.")
 
-    current_namespace = initial_namespace if initial_namespace != "all" else None
-    while True:
-        pods = list_pods(current_namespace)
-        display_dashboard(pods, current_namespace)
-        choice = input().strip().lower()
-        if choice == 'q':
-            print(f"{colorama.Fore.GREEN}Exiting program.")
-            sys.exit(0)
-        elif choice == 'all':
-            current_namespace = None
-            continue
-        elif choice:  # Assume it's a namespace name or pod ID
+    if sys.stdin.isatty():
+        # Interactive mode: Run CLI dashboard
+        current_namespace = initial_namespace if initial_namespace != "all" else None
+        while True:
+            pods = list_pods(current_namespace)
+            display_dashboard(pods, current_namespace)
             try:
-                pod_index = int(choice) - 1
-                if 0 <= pod_index < len(pods):
-                    selected_pod = pods[pod_index]
-                    print(f"{colorama.Fore.CYAN}Logs are now streaming at http://localhost:5000. Open this URL in your browser.")
-                    stream_pod_logs(selected_pod["name"], selected_pod["namespace"])
-                else:
-                    raise ValueError
-            except ValueError:
-                # Treat as namespace filter
-                current_namespace = choice
-                print(f"{colorama.Fore.YELLOW}Switching to namespace '{choice}'...")
-        else:
-            print(f"{colorama.Fore.RED}Invalid input. Press Enter...")
-            input()
+                choice = input().strip().lower()
+            except EOFError:
+                print(f"{colorama.Fore.RED}Input error. Exiting.")
+                break   
+            if choice == 'q':
+                print(f"{colorama.Fore.GREEN}Exiting program.")
+                sys.exit(0)
+            elif choice == 'all':
+                current_namespace = None
+                continue
+            elif choice:  # Assume it's a namespace name or pod ID
+                try:
+                    pod_index = int(choice) - 1
+                    if 0 <= pod_index < len(pods):
+                        selected_pod = pods[pod_index]
+                        print(f"{colorama.Fore.CYAN}Logs are now streaming at http://localhost:5000. Open this URL in your browser.")
+                        stream_pod_logs(selected_pod["name"], selected_pod["namespace"])
+                    else:
+                        raise ValueError
+                except ValueError:
+                    # Treat as namespace filter
+                    current_namespace = choice
+                    print(f"{colorama.Fore.YELLOW}Switching to namespace '{choice}'...")
+            else:
+                print(f"{colorama.Fore.RED}Invalid input. Press Enter...")
+                input()
+    else:
+        # Non-interactive mode (e.g., Docker): Just keep running
+        print(f"{colorama.Fore.GREEN}Running in non-interactive mode. Use the web interface at http://localhost:5000")
+        while True:
+            time.sleep(1)  # Keep the container alive
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kubernetes Pod Log Viewer")
     parser.add_argument("--namespace", default="bizagi", help="Starting namespace (default: all; use 'default' for specific)")
     args = parser.parse_args()
-    signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))0
     main(args.namespace)
