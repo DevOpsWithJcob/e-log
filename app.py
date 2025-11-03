@@ -29,42 +29,83 @@ stream_thread = None  # Global stream thread
 redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
 
 # Allowed namespaces for restriction
-ALLOWED_NAMESPACES = ["kavosh", "secure", "bizagi"]
+# ALLOWED_NAMESPACES = ["kavosh", "secure", "bizagi"]
+ALLOWED_NAMESPACES = os.environ.get("ALLOWED_NAMESPACES", "kavosh,secure,bizagi").split(",")
 
+APPLICATION_MODE = os.environ.get("APPLICATION_MODE", "development")  # or "production"
 # Flask app setup
 app = Flask(__name__)
 
+# Secret key for session management (use env var in production)
+if APPLICATION_MODE == "production":
+    app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+
+app.secret_key = "8ec4231fdba2795cf0a049b043443c8a75214dd5dd226dca7b1cba27d5cea55e"
+
+# Per-session state store
+# session_id -> {
+#   'current_pod': {'name': str, 'namespace': str} | None,
+#   'log_queue': queue.Queue,
+#   'input_queue': queue.Queue,
+#   'stop_event': threading.Event,
+#   'stream_thread': threading.Thread | None
+# }
+_sessions = {}
+
+
+def _get_session_id():
+    from flask import session
+    # Create a stable session id for the user
+    if 'sid' not in session:
+        # High entropy random id
+        session['sid'] = os.urandom(16).hex()
+    return session['sid']
+
+
+def _get_or_create_state():
+    sid = _get_session_id()
+    if sid not in _sessions:
+        _sessions[sid] = {
+            'current_pod': None,
+            'log_queue': queue.Queue(),
+            'input_queue': queue.Queue(),
+            'stop_event': threading.Event(),
+            'stream_thread': None,
+        }
+    return sid, _sessions[sid]
+
 @app.route('/logs')
 def logs():
-    """SSE endpoint for streaming logs with improved real-time handling."""
+    """SSE endpoint for streaming logs with improved real-time handling per session."""
+    sid, state = _get_or_create_state()
+
     def generate():
         yield 'data: {"message": "Connected to log stream"}\n\n'
         last_yield_time = time.time()
         has_yielded_waiting = False
-        while not stop_event.is_set():
+        while not state['stop_event'].is_set():
             try:
-                line = log_queue.get(timeout=0.05)  # Even shorter timeout for better responsiveness
-                if line == '__END__':  # Sentinel to end stream
+                line = state['log_queue'].get(timeout=0.05)
+                if line == '__END__':
                     break
-                # Yield as JSON to avoid parse errors in JS
-                yield f'data: {json.dumps({"log": line, "timestamp": time.time()})}\n\n'  # Add timestamp for live feel
+                yield f'data: {json.dumps({"log": line, "timestamp": time.time()})}\n\n'
                 last_yield_time = time.time()
-                has_yielded_waiting = False  # Reset if we got a log
+                has_yielded_waiting = False
             except queue.Empty:
                 current_time = time.time()
-                if current_pod is None:
+                if state['current_pod'] is None:
                     yield f'data: {json.dumps({"message": "No pod selected. Select a pod in the terminal or via web."})}\n\n'
                     last_yield_time = current_time
                 elif not has_yielded_waiting:
                     yield f'data: {json.dumps({"message": "Waiting for logs..."})}\n\n'
                     last_yield_time = current_time
-                    has_yielded_waiting = True  # Only yield waiting once
-                elif current_time - last_yield_time > 10:  # Heartbeat every 10 seconds for better liveness
+                    has_yielded_waiting = True
+                elif current_time - last_yield_time > 10:
                     yield ': heartbeat\n\n'
                     last_yield_time = current_time
-                time.sleep(0.05)  # Shorter sleep for improved responsiveness
+                time.sleep(0.05)
         yield f'data: {json.dumps({"message": "Log stream ended. Select another pod in terminal or web."})}\n\n'
-    
+
     return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/namespaces')
@@ -89,20 +130,21 @@ def get_pods_in_namespace(namespace):
 
 @app.route('/select_pod/<namespace>/<pod_name>')
 def select_pod(namespace, pod_name):
-    """Select a pod and start streaming its logs, load from cache first (only if namespace allowed)."""
+    """Select a pod and start streaming its logs for this session. Load from cache first (only if namespace allowed)."""
+    sid, state = _get_or_create_state()
     if namespace not in ALLOWED_NAMESPACES:
         return "Namespace not allowed", 403
-    print(f"{colorama.Fore.YELLOW}Pod selected from web: {pod_name} in {namespace}")
-    stop_log_streaming()
-    
-    # Load cached logs if available
+    print(f"{colorama.Fore.YELLOW}[sid={sid}] Pod selected from web: {pod_name} in {namespace}")
+    stop_log_streaming(state)
+
+    # Load cached logs specific to this pod for warm start
     cache_key = f"logs:{namespace}:{pod_name}"
     cached_logs = redis_client.lrange(cache_key, 0, -1)
     if cached_logs:
         for log in cached_logs:
-            log_queue.put(log)
-    
-    start_log_streaming(pod_name, namespace)
+            state['log_queue'].put(log)
+
+    start_log_streaming(pod_name, namespace, state)
     return "OK"
 
 @app.route('/')
@@ -254,74 +296,72 @@ def display_dashboard(pods: List[dict], current_namespace: str) -> None:
             print(f"{colorama.Fore.GREEN}{pod['index']}: {pod['name']} (Namespace: {pod['namespace']})")
     print(f"{colorama.Fore.CYAN}Enter pod ID to view logs in web and terminal, namespace name to filter (or 'all'/'q' to quit): ", end="")
 
-def start_log_streaming(pod_name: str, namespace: str) -> None:
-    """Start streaming logs from the pod into the queue for Flask and print to terminal, cache in Redis."""
-    global current_pod, stream_thread
+def start_log_streaming(pod_name: str, namespace: str, state: dict) -> None:
+    """Start streaming logs from the pod into the per-session queue and cache in Redis."""
     if namespace not in ALLOWED_NAMESPACES:
         print(f"{colorama.Fore.RED}Namespace '{namespace}' not allowed.")
         return
-    current_pod = {'name': pod_name, 'namespace': namespace}
-    stop_event.clear()  # Reset stop event
-    
-    # Clear the queue to avoid old logs
-    while not log_queue.empty():
+    state['current_pod'] = {'name': pod_name, 'namespace': namespace}
+    state['stop_event'].clear()
+
+    # Clear the session queue to avoid old logs
+    while not state['log_queue'].empty():
         try:
-            log_queue.get_nowait()
+            state['log_queue'].get_nowait()
         except queue.Empty:
             break
-    
+
     cache_key = f"logs:{namespace}:{pod_name}"
-    redis_client.delete(cache_key)  # Clear old cache
-    
+    redis_client.delete(cache_key)  # Clear old cache for this pod (shared cache)
+
     def streamer():
         v1 = client.CoreV1Api()
         w = watch.Watch()
         try:
             for line in w.stream(v1.read_namespaced_pod_log, name=pod_name, namespace=namespace, follow=True, tail_lines=100):
-                if stop_event.is_set():
+                if state['stop_event'].is_set():
                     break
-                print(line)  # Print to terminal
-                log_queue.put(line)  # Put log line into queue for Flask
-                redis_client.rpush(cache_key, line)  # Cache in Redis (list, keep last 1000 lines)
+                print(line)
+                state['log_queue'].put(line)
+                redis_client.rpush(cache_key, line)
                 if redis_client.llen(cache_key) > 1000:
-                    redis_client.lpop(cache_key)  # Trim to 1000 lines
+                    redis_client.lpop(cache_key)
         except ApiException as e:
             error_msg = f"Error streaming logs: {e}"
             print(f"{colorama.Fore.RED}{error_msg}")
-            log_queue.put(error_msg)
+            state['log_queue'].put(error_msg)
             redis_client.rpush(cache_key, error_msg)
         finally:
             w.stop()
-            log_queue.put('__END__')  # Sentinel to end SSE stream
-            current_pod = None
+            state['log_queue'].put('__END__')
+            state['current_pod'] = None
 
-    stream_thread = threading.Thread(target=streamer)
-    stream_thread.start()
+    state['stream_thread'] = threading.Thread(target=streamer)
+    state['stream_thread'].start()
 
-def stop_log_streaming() -> None:
-    """Stop the current log streaming if active."""
-    global stream_thread
-    stop_event.set()
-    if stream_thread and stream_thread.is_alive():
-        stream_thread.join(timeout=2.0)
-        stream_thread = None
+def stop_log_streaming(state: dict) -> None:
+    """Stop the current log streaming for this session if active."""
+    state['stop_event'].set()
+    if state.get('stream_thread') and state['stream_thread'].is_alive():
+        state['stream_thread'].join(timeout=2.0)
+        state['stream_thread'] = None
 
-def stream_pod_logs(pod_name: str, namespace: str) -> None:
-    """Manage log streaming with user input handling."""
+def stream_pod_logs(pod_name: str, namespace: str, state: dict) -> None:
+    """Manage log streaming with user input handling for the current TTY session only."""
     if namespace not in ALLOWED_NAMESPACES:
         print(f"{colorama.Fore.RED}Namespace '{namespace}' not allowed.")
         return
     print(f"\n{colorama.Fore.CYAN}Streaming logs for pod '{pod_name}' in '{namespace}' to web and terminal (including last 100 lines; Type 'q' and press Enter to return; Ctrl+C also works)...")
 
-    stop_log_streaming()  # Stop any existing stream
-    start_log_streaming(pod_name, namespace)
+    stop_log_streaming(state)  # Stop any existing stream for this session
+    start_log_streaming(pod_name, namespace, state)
 
     # Input reader thread
     def input_reader():
         try:
-            while not stop_event.is_set():
+            while not state['stop_event'].is_set():
                 line = input()
-                input_queue.put(line.strip().lower())
+                state['input_queue'].put(line.strip().lower())
         except EOFError:
             pass
 
@@ -329,9 +369,9 @@ def stream_pod_logs(pod_name: str, namespace: str) -> None:
     input_thread.start()
 
     try:
-        while stream_thread and stream_thread.is_alive() and not stop_event.is_set():
+        while state.get('stream_thread') and state['stream_thread'].is_alive() and not state['stop_event'].is_set():
             try:
-                user_input = input_queue.get(timeout=0.5)
+                user_input = state['input_queue'].get(timeout=0.5)
                 if user_input == 'q':
                     print(f"\n{colorama.Fore.YELLOW}Exiting logs (user requested). Returning to dashboard...")
                     break
@@ -340,8 +380,8 @@ def stream_pod_logs(pod_name: str, namespace: str) -> None:
     except KeyboardInterrupt:
         print(f"\n{colorama.Fore.YELLOW}Logs interrupted (Ctrl+C). Returning to dashboard...")
     finally:
-        stop_event.set()  # Ensure input reader stops
-        stop_log_streaming()
+        state['stop_event'].set()  # Ensure input reader stops
+        stop_log_streaming(state)
         input_thread.join(timeout=1.0)
 
 def main(initial_namespace: str) -> None:
@@ -352,7 +392,7 @@ def main(initial_namespace: str) -> None:
     # Start Flask in background
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print(f"{colorama.Fore.GREEN}Flask web server started. Visit http://localhost:5000 for pod list and logs.")
+    print(f"{colorama.Fore.GREEN}Flask web server started. Visit http://localhost:5000 for pod list and logs. Multiple users can connect concurrently.")
 
     if sys.stdin.isatty():
         # Interactive mode: Run CLI dashboard
@@ -377,7 +417,17 @@ def main(initial_namespace: str) -> None:
                     if 0 <= pod_index < len(pods):
                         selected_pod = pods[pod_index]
                         print(f"{colorama.Fore.CYAN}Logs are now streaming at http://localhost:5000. Open this URL in your browser.")
-                        stream_pod_logs(selected_pod["name"], selected_pod["namespace"])
+                        # Use a dedicated state for CLI user as well (isolated from web sessions)
+                        cli_sid = 'cli-session'
+                        if cli_sid not in _sessions:
+                            _sessions[cli_sid] = {
+                                'current_pod': None,
+                                'log_queue': queue.Queue(),
+                                'input_queue': queue.Queue(),
+                                'stop_event': threading.Event(),
+                                'stream_thread': None,
+                            }
+                        stream_pod_logs(selected_pod["name"], selected_pod["namespace"], _sessions[cli_sid])
                     else:
                         raise ValueError
                 except ValueError:
